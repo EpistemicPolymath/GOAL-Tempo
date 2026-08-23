@@ -1,42 +1,87 @@
 ;; goal_src/user/goal-tempo.gc
 
-(defun tempo-test ()
-  (format #t "========================================~%")
-  (format #t "Hello from GOAL-Tempo! Your REPL is live.~%")
-  (if *target*
-      (format #t "Jak's Position: X: ~M | Y: ~M | Z: ~M~%"
-              (-> *target* control trans x)
-              (-> *target* control trans y)
-              (-> *target* control trans z))
-      (format #t "Jak is not spawned in the world right now.~%"))
-  (format #t "========================================~%")
+;; 1. Define our custom process type that inherits from the engine's base process
+(deftype tempo-process (process)
+  ()
   )
 
-  ;; defun tempo-test: Declares a new global function named tempo-test
-  ;; format #t: Prints text to the active compiler REPL listener
-  ;; if -> *target* control trans x: Navigates Jak's process to read his control translation vector (3D coordinates)
-  ;; ~M: Naughty Dog's custom format code that automatically converts internal game distance units into readable meters
+;; Global variables to track state
+(define *tempo-process* (the-as handle #f))
+(define *tempo-bpm* 120)
 
-  (defun tempo-input-test ()
-    (format #t "--- Controller 1 Input Status ---~%")
-    (cond
-        ((cpad-hold? 0 x)
-        (format #t "Status: Holding [X] (Spacebar on Keyboard)~%"))
-        ((cpad-hold? 0 circle)
-        (format #t "Status: Holding [Circle] (E on Keyboard)~%"))
-        ((cpad-hold? 0 square)
-        (format #t "Status: Holding [Square] (F on Keyboard)~%"))
-        ((cpad-hold? 0 triangle)
-        (format #t "Status: Holding [Triangle] (R on Keyboard)~%"))
-        (else
-        (format #t "Status: No action buttons are pressed.~%"))
-        )
-    (format #t "--------------------------------~%")
+;; 2. Define the idle state containing our real-time frame loop
+(defstate tempo-idle (tempo-process)
+  :code (lambda ()
+          (let ((last-beat-idx -1))
+            (loop
+              ;; Calculate ticks per beat (300 ticks/sec * 60 sec = 18000 ticks/min)
+              (let* ((ticks-per-beat (/ 18000 *tempo-bpm*))
+                     (current-ticks (current-time))
+                     (beat-idx (/ current-ticks ticks-per-beat))
+                     (tick-in-beat (mod current-ticks ticks-per-beat)))
+                
+                ;; Draw directly onto the game screen using the console overlay buffer!
+                (format *stdcon* "========================================~%")
+                (format *stdcon* "        GOAL-TEMPO METRONOME LIVE       ~%")
+                (format *stdcon* "========================================~%")
+                (format *stdcon* "BPM: ~D  |  Ticks Per Beat: ~D~%" *tempo-bpm* ticks-per-beat)
+                (format *stdcon* "Current Beat: ~D  |  Tick in Beat: ~D~%" beat-idx tick-in-beat)
+                
+                ;; Trigger metronome audio tick when entering a new beat
+                (when (!= beat-idx last-beat-idx)
+                  (set! last-beat-idx beat-idx)
+                  ;; FIX: Play the sound directly at Jak's location ("money" = orb sound)
+                  (sound-play "money" :position (the-as symbol (target-pos 0)))
+                  )
+                
+                ;; Capture and overlay physical controller inputs in real-time
+                (format *stdcon* "----------------------------------------~%")
+                (format *stdcon* "CPAD-0 Input State:~%")
+                (cond
+                  ((cpad-hold? 0 x)
+                   (format *stdcon* "  Holding: [X] (Spacebar)~%"))
+                  ((cpad-hold? 0 circle)
+                   (format *stdcon* "  Holding: [Circle] (E Key)~%"))
+                  ((cpad-hold? 0 square)
+                   (format *stdcon* "  Holding: [Square] (F Key)~%"))
+                  ((cpad-hold? 0 triangle)
+                   (format *stdcon* "  Holding: [Triangle] (R Key)~%"))
+                  (else
+                   (format *stdcon* "  Holding: None~%"))
+                  )
+                (format *stdcon* "========================================~%")
+                )
+              
+              ;; Suspend execution until the next frame (yielding back to the kernel)
+              (suspend)
+              )
+            )
+          )
   )
-;; OpenGOAL manages hardware controllers through a global structure called *cpad-list*
-;; The game engine comes with a built-in macro called cpad-hold? that checks if a specific button is currently being held down on a given controller
+
+;; 3. Helper functions to safely start and stop the process
+(defun tempo-stop ()
+  ;; FIX: Pass *active-pool* as the second argument to search and destroy inside the active tree
+  (kill-by-type tempo-process *active-pool*)
+  (set! *tempo-process* (the-as handle #f))
+  (format #t "GOAL-Tempo background process stopped cleanly and screen cleared.~%")
+  (none)
+  )
+
+(defun tempo-start ()
+  ;; FIX: Stop any active instances first before spawning a new one to prevent duplication
+  (tempo-stop)
+  (let ((proc (get-process *nk-dead-pool* tempo-process 1024)))
+    (when proc
+      (activate proc *active-pool* 'tempo *kernel-dram-stack*)
+      (run-now-in-process proc (lambda () (go tempo-idle)))
+      (set! *tempo-process* (process->handle proc))
+      (format #t "GOAL-Tempo background process started!~%")
+      )
+    )
+  (none)
+  )
 
 ; Action Buttons: x, circle, square, triangle
 ; Shoulder Buttons: l1, r1, l2, r2
 ; Directions: up, down, left, right
-
