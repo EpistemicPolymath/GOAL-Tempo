@@ -1,6 +1,6 @@
 ;; goal_src/user/goal-tempo.gc
 
-;; 1. Define our custom process type that inherits from the engine's base process
+;; 1. Define our custom process type
 (deftype tempo-process (process)
   ()
   )
@@ -8,6 +8,7 @@
 ;; Global variables to track state
 (define *tempo-process* (the-as handle #f))
 (define *tempo-bpm* 120)
+(define *tempo-beats-per-measure* 4) ;; Set to 4 for 4/4 time, 3 for 3/4, etc.
 
 ;; 2. Define the idle state containing our real-time frame loop
 (defstate tempo-idle (tempo-process)
@@ -16,22 +17,33 @@
             (loop
               ;; Calculate ticks per beat (300 ticks/sec * 60 sec = 18000 ticks/min)
               (let* ((ticks-per-beat (/ 18000 *tempo-bpm*))
-                     (current-ticks (current-time))
+                     (current-ticks (the int (current-time)))
                      (beat-idx (/ current-ticks ticks-per-beat))
-                     (tick-in-beat (mod current-ticks ticks-per-beat)))
+                     (tick-in-beat (mod current-ticks ticks-per-beat))
+                     
+                     ;; Calculate which beat of the measure we are on (0, 1, 2, 3)
+                     (measure-beat (mod beat-idx *tempo-beats-per-measure*))
+                     )
                 
                 ;; Draw directly onto the game screen using the console overlay buffer!
                 (format *stdcon* "========================================~%")
                 (format *stdcon* "        GOAL-TEMPO METRONOME LIVE       ~%")
                 (format *stdcon* "========================================~%")
                 (format *stdcon* "BPM: ~D  |  Ticks Per Beat: ~D~%" *tempo-bpm* ticks-per-beat)
-                (format *stdcon* "Current Beat: ~D  |  Tick in Beat: ~D~%" beat-idx tick-in-beat)
+                
+                ;; Display 1-based indexing for musician readability (1, 2, 3, 4)
+                (format *stdcon* "Beat of Measure: ~D / ~D  |  Tick: ~D~%" 
+                        (+ measure-beat 1) *tempo-beats-per-measure* tick-in-beat)
                 
                 ;; Trigger metronome audio tick when entering a new beat
                 (when (!= beat-idx last-beat-idx)
                   (set! last-beat-idx beat-idx)
-                  ;; FIX: Play the sound directly at Jak's location ("money" = orb sound)
-                  (sound-play "money" :position (the-as symbol (target-pos 0)))
+                  (if (= measure-beat 0)
+                      ;; Beat 1: Accented high-pitched ping (pitch offset: 1200)
+                      (sound-play-by-name (static-sound-name "money-pickup") (new-sound-id) 1024 1200 0 (the sound-group 1) #t)
+                      ;; Beats 2, 3, 4: Regular low-pitched clicks (pitch offset: -200)
+                      (sound-play-by-name (static-sound-name "money-pickup") (new-sound-id) 1024 -200 0 (the sound-group 1) #t)
+                      )
                   )
                 
                 ;; Capture and overlay physical controller inputs in real-time
@@ -46,13 +58,17 @@
                    (format *stdcon* "  Holding: [Square] (F Key)~%"))
                   ((cpad-hold? 0 triangle)
                    (format *stdcon* "  Holding: [Triangle] (R Key)~%"))
+                  ((cpad-hold? 0 l1)
+                   (format *stdcon* "  Holding: [L1] (Q Key)~%"))
+                  ((cpad-hold? 0 r1)
+                   (format *stdcon* "  Holding: [R1] (W Key)~%"))
                   (else
                    (format *stdcon* "  Holding: None~%"))
                   )
                 (format *stdcon* "========================================~%")
                 )
               
-              ;; Suspend execution until the next frame (yielding back to the kernel)
+              ;; Suspend execution until the next frame
               (suspend)
               )
             )
@@ -61,7 +77,6 @@
 
 ;; 3. Helper functions to safely start and stop the process
 (defun tempo-stop ()
-  ;; FIX: Pass *active-pool* as the second argument to search and destroy inside the active tree
   (kill-by-type tempo-process *active-pool*)
   (set! *tempo-process* (the-as handle #f))
   (format #t "GOAL-Tempo background process stopped cleanly and screen cleared.~%")
@@ -69,7 +84,6 @@
   )
 
 (defun tempo-start ()
-  ;; FIX: Stop any active instances first before spawning a new one to prevent duplication
   (tempo-stop)
   (let ((proc (get-process *nk-dead-pool* tempo-process 1024)))
     (when proc
