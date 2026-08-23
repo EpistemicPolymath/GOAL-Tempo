@@ -8,64 +8,157 @@
 ;; Global variables to track state
 (define *tempo-process* (the-as handle #f))
 (define *tempo-bpm* 120)
-(define *tempo-beats-per-measure* 4) ;; Set to 4 for 4/4 time, 3 for 3/4, etc.
+(define *tempo-beats-per-measure* 4)
 
-;; 2. Define the idle state containing our real-time frame loop
+;; --- DYNAMIC DRILL CONFIGURATION ---
+(define *tempo-drill-name* "Punch -> Roll Jump")
+(define *tempo-btn-1* 'square)        ;; First input to register
+(define *tempo-btn-2* 'l1)            ;; Primary second input
+(define *tempo-btn-2-alt* 'x)         ;; Optional alternate second input (e.g. L1 or X)
+(define *tempo-target-min-frames* 2)  ;; Lower bound of perfect execution window
+(define *tempo-target-max-frames* 5)  ;; Upper bound of perfect execution window
+
+;; Training State Variables
+(define *first-input-time* 0)
+(define *second-input-time* 0)
+(define *last-gap-ticks* 0)
+(define *last-gap-frames* 0)
+(define *combo-success* #f)
+
+;; 2. Dynamic button-hold helper function
+(defun cpad-hold-by-symbol? ((pad int) (btn symbol))
+  (cond
+    ((= btn 'x) (cpad-hold? pad x))
+    ((= btn 'circle) (cpad-hold? pad circle))
+    ((= btn 'square) (cpad-hold? pad square))
+    ((= btn 'triangle) (cpad-hold? pad triangle))
+    ((= btn 'l1) (cpad-hold? pad l1))
+    ((= btn 'r1) (cpad-hold? pad r1))
+    ((= btn 'l2) (cpad-hold? pad l2))
+    ((= btn 'r2) (cpad-hold? pad r2))
+    ((= btn 'up) (cpad-hold? pad up))
+    ((= btn 'down) (cpad-hold? pad down))
+    ((= btn 'left) (cpad-hold? pad left))
+    ((= btn 'right) (cpad-hold? pad right))
+    (else #f)
+    )
+  )
+
+;; 3. Define the idle state containing our real-time frame loop
 (defstate tempo-idle (tempo-process)
   :code (lambda ()
-          (let ((last-beat-idx -1))
+          (let ((last-beat-idx -1)
+                (btn1-was-held #f)
+                (btn2-was-held #f)
+                (btn2-captured #f)
+                )
             (loop
               ;; Calculate ticks per beat (300 ticks/sec * 60 sec = 18000 ticks/min)
               (let* ((ticks-per-beat (/ 18000 *tempo-bpm*))
                      (current-ticks (the int (current-time)))
                      (beat-idx (/ current-ticks ticks-per-beat))
                      (tick-in-beat (mod current-ticks ticks-per-beat))
-                     
-                     ;; Calculate which beat of the measure we are on (0, 1, 2, 3)
                      (measure-beat (mod beat-idx *tempo-beats-per-measure*))
                      )
                 
-                ;; Draw directly onto the game screen using the console overlay buffer!
+                ;; --- 1. DYNAMIC INPUT CAPTURE ---
+                
+                ;; Detect the first frame of Input 1
+                (cond
+                  ((cpad-hold-by-symbol? 0 *tempo-btn-1*)
+                   (when (not btn1-was-held)
+                     (set! *first-input-time* current-ticks)
+                     (set! btn1-was-held #t)
+                     (set! btn2-captured #f)
+                     )
+                   )
+                  (else
+                   (set! btn1-was-held #f)
+                   )
+                )
+                
+                ;; Detect the first frame of Input 2 (or its alternate) after Input 1
+                (cond
+                  ((or (cpad-hold-by-symbol? 0 *tempo-btn-2*)
+                       (cpad-hold-by-symbol? 0 *tempo-btn-2-alt*))
+                   (when (and (not btn2-was-held) (> *first-input-time* 0) (not btn2-captured))
+                     (set! *second-input-time* current-ticks)
+                     (set! *last-gap-ticks* (- *second-input-time* *first-input-time*))
+                     ;; 5 ticks = 1 frame (300 ticks/sec / 60 frames/sec)
+                     (set! *last-gap-frames* (/ *last-gap-ticks* 5)) 
+                     (set! btn2-captured #t)
+                     
+                     ;; Evaluate target timing window dynamically
+                     (if (and (>= *last-gap-frames* *tempo-target-min-frames*)
+                              (<= *last-gap-frames* *tempo-target-max-frames*))
+                         (set! *combo-success* #t)
+                         (set! *combo-success* #f)
+                         )
+                     )
+                   (set! btn2-was-held #t)
+                   )
+                  (else
+                   (set! btn2-was-held #f)
+                   )
+                )
+                
+                ;; --- 2. DRAW TRAINER DASHBOARD OVERLAY ---
+                ;; Formatting colors: ~3L = Red, ~5L = Yellow, ~6L = Green, ~0L = Default
                 (format *stdcon* "========================================~%")
                 (format *stdcon* "        GOAL-TEMPO METRONOME LIVE       ~%")
                 (format *stdcon* "========================================~%")
-                (format *stdcon* "BPM: ~D  |  Ticks Per Beat: ~D~%" *tempo-bpm* ticks-per-beat)
+                (format *stdcon* "BPM: ~D  |  Measure: ~D / ~D~%" 
+                        *tempo-bpm* (+ measure-beat 1) *tempo-beats-per-measure*)
                 
-                ;; Display 1-based indexing for musician readability (1, 2, 3, 4)
-                (format *stdcon* "Beat of Measure: ~D / ~D  |  Tick: ~D~%" 
-                        (+ measure-beat 1) *tempo-beats-per-measure* tick-in-beat)
+                (format *stdcon* "----------------------------------------~%")
+                (format *stdcon* "       MOVEMENT TECH COMBO DRILLS       ~%")
+                (format *stdcon* " Target: ~S (~A -> ~A)~%" 
+                        *tempo-drill-name* *tempo-btn-1* *tempo-btn-2*)
+                (format *stdcon* " Goal Window: ~D to ~D frames~%" 
+                        *tempo-target-min-frames* *tempo-target-max-frames*)
+                (format *stdcon* "----------------------------------------~%")
                 
-                ;; Trigger metronome audio tick when entering a new beat
+                (if (= *first-input-time* 0)
+                    (format *stdcon* "Status: ~5LWAITING FOR FIRST INPUT [~A]~0L~%" *tempo-btn-1*)
+                    (begin
+                      (format *stdcon* "Input [~A] registered at: ~D ticks~%" *tempo-btn-1* *first-input-time*)
+                      (if (= *second-input-time* 0)
+                          (format *stdcon* "Status: ~5LFirst input hit! Press [~A] next...~0L~%" *tempo-btn-2*)
+                          (begin
+                            (format *stdcon* "Input [~A] registered at: ~D ticks~%" *tempo-btn-2* *second-input-time*)
+                            (format *stdcon* "Interval: ~D ticks (~D frames)~%" *last-gap-ticks* *last-gap-frames*)
+                            
+                            ;; Output real-time coaching using our dynamic criteria
+                            (cond
+                              ((< *last-gap-frames* *tempo-target-min-frames*)
+                               (format *stdcon* "Evaluation: ~3LTOO FAST! (~D frames)~0L~%" *last-gap-frames*)
+                               (format *stdcon* "Coaching: Slow down your second input.~%")
+                               )
+                               (*combo-success*
+                               (format *stdcon* "Evaluation: ~6LPERFECT TIMING! (~D frames)~0L~%" *last-gap-frames*)
+                               (format *stdcon* "Coaching: Great muscle memory! Keep drilling.~%")
+                               )
+                              (else
+                               (format *stdcon* "Evaluation: ~3LTOO SLOW! (~D frames)~0L~%" *last-gap-frames*)
+                               (format *stdcon* "Coaching: Speed up your fingers.~%")
+                               )
+                              )
+                            )
+                          )
+                      )
+                    )
+                (format *stdcon* "========================================~%")
+                
+                ;; --- 3. ACCENTED AUDIBLE METRONOME ---
                 (when (!= beat-idx last-beat-idx)
                   (set! last-beat-idx beat-idx)
                   (if (= measure-beat 0)
-                      ;; Beat 1: Accented high-pitched ping (pitch offset: 1200)
+                      ;; Beat 1: High pitch ping
                       (sound-play-by-name (static-sound-name "money-pickup") (new-sound-id) 1024 1200 0 (the sound-group 1) #t)
-                      ;; Beats 2, 3, 4: Regular low-pitched clicks (pitch offset: -200)
+                      ;; Beats 2-4: Low pitch tick
                       (sound-play-by-name (static-sound-name "money-pickup") (new-sound-id) 1024 -200 0 (the sound-group 1) #t)
                       )
                   )
-                
-                ;; Capture and overlay physical controller inputs in real-time
-                (format *stdcon* "----------------------------------------~%")
-                (format *stdcon* "CPAD-0 Input State:~%")
-                (cond
-                  ((cpad-hold? 0 x)
-                   (format *stdcon* "  Holding: [X] (Spacebar)~%"))
-                  ((cpad-hold? 0 circle)
-                   (format *stdcon* "  Holding: [Circle] (E Key)~%"))
-                  ((cpad-hold? 0 square)
-                   (format *stdcon* "  Holding: [Square] (F Key)~%"))
-                  ((cpad-hold? 0 triangle)
-                   (format *stdcon* "  Holding: [Triangle] (R Key)~%"))
-                  ((cpad-hold? 0 l1)
-                   (format *stdcon* "  Holding: [L1] (Q Key)~%"))
-                  ((cpad-hold? 0 r1)
-                   (format *stdcon* "  Holding: [R1] (W Key)~%"))
-                  (else
-                   (format *stdcon* "  Holding: None~%"))
-                  )
-                (format *stdcon* "========================================~%")
                 )
               
               ;; Suspend execution until the next frame
@@ -75,7 +168,7 @@
           )
   )
 
-;; 3. Helper functions to safely start and stop the process
+;; 4. Helper functions to safely start and stop the process
 (defun tempo-stop ()
   (kill-by-type tempo-process *active-pool*)
   (set! *tempo-process* (the-as handle #f))
@@ -85,6 +178,12 @@
 
 (defun tempo-start ()
   (tempo-stop)
+  ;; Reset states on start
+  (set! *first-input-time* 0)
+  (set! *second-input-time* 0)
+  (set! *last-gap-ticks* 0)
+  (set! *last-gap-frames* 0)
+  (set! *combo-success* #f)
   (let ((proc (get-process *nk-dead-pool* tempo-process 1024)))
     (when proc
       (activate proc *active-pool* 'tempo *kernel-dram-stack*)
