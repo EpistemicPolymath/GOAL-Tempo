@@ -1,0 +1,18 @@
+;; goal_src/user/goal-tempo.gc
+
+(defun tempo-test ()
+  (format #t "========================================~%")
+  (format #t "Hello from GOAL-Tempo! Your REPL is live.~%")
+  (if *target*
+      (format #t "Jak's Position: X: ~M | Y: ~M | Z: ~M~%"
+              (-> *target* control trans x)
+              (-> *target* control trans y)
+              (-> *target* control trans z))
+      (format #t "Jak is not spawned in the world right now.~%"))
+  (format #t "========================================~%")
+  )
+
+  ;; defun tempo-test: Declares a new global function named tempo-test
+  ;; format #t: Prints text to the active compiler REPL listener
+  ;; if -> *target* control trans x: Navigates Jak's process to read his control translation vector (3D coordinates)
+  ;; ~M: Naughty Dog's custom format code that automatically converts internal game distance units into readable meters
