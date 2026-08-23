@@ -16,3 +16,27 @@
   ;; format #t: Prints text to the active compiler REPL listener
   ;; if -> *target* control trans x: Navigates Jak's process to read his control translation vector (3D coordinates)
   ;; ~M: Naughty Dog's custom format code that automatically converts internal game distance units into readable meters
+
+  (defun tempo-input-test ()
+    (format #t "--- Controller 1 Input Status ---~%")
+    (cond
+        ((cpad-hold? 0 x)
+        (format #t "Status: Holding [X] (Spacebar on Keyboard)~%"))
+        ((cpad-hold? 0 circle)
+        (format #t "Status: Holding [Circle] (E on Keyboard)~%"))
+        ((cpad-hold? 0 square)
+        (format #t "Status: Holding [Square] (F on Keyboard)~%"))
+        ((cpad-hold? 0 triangle)
+        (format #t "Status: Holding [Triangle] (R on Keyboard)~%"))
+        (else
+        (format #t "Status: No action buttons are pressed.~%"))
+        )
+    (format #t "--------------------------------~%")
+  )
+;; OpenGOAL manages hardware controllers through a global structure called *cpad-list*
+;; The game engine comes with a built-in macro called cpad-hold? that checks if a specific button is currently being held down on a given controller
+
+; Action Buttons: x, circle, square, triangle
+; Shoulder Buttons: l1, r1, l2, r2
+; Directions: up, down, left, right
+
