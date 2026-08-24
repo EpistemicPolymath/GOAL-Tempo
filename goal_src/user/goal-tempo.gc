@@ -1,8 +1,18 @@
 ;; goal_src/user/goal-tempo.gc
 
-;; 1. Define our custom process type
-(deftype tempo-process (process)
-  ()
+;; 1. Define our custom process type with heap fields to prevent stack overflows!
+(deftype tempo-coach-process (process)
+  ((last-beat-idx       int32)
+   (last-state          symbol)
+   (btn1-was-held       symbol)
+   (btn2-was-held       symbol)
+   (btn3-was-held       symbol)
+   (p2-captured         symbol)
+   (p3-captured         symbol)
+   (beat-start-ticks    int32)
+   (played-beat-2       symbol)
+   (played-beat-3       symbol)
+   )
   )
 
 ;; Global variables to track state
@@ -14,7 +24,7 @@
 (define *drill-title* "Punch-Roll-Jump (PRJ)")
 (define *drill-state-1* 'target-running-attack)
 (define *drill-state-2* 'target-wheel)
-(define *drill-state-3* 'target-wheel-flip) ;; FIXED: Corrected from target-flip to target-wheel-flip!
+(define *drill-state-3* 'target-wheel-flip) ;; Corrected from target-flip to target-wheel-flip!
 
 (define *drill-btn-1* 'square)
 (define *drill-btn-2* 'l1)
@@ -36,9 +46,23 @@
 (define *p3-time* 0)
 
 ;; Session Tracker Stats
+;; Symbol status to prevent heap string comparisons: 'ready, 'gap1-active, 'gap2-active, 'success, 'eaten-gap1, 'eaten-gap2, 'eaten-uppercut, 'eaten-punch-jump
 (define *drill-attempts* 0)
 (define *drill-successes* 0)
-(define *drill-status* "WAITING") ;; "WAITING", "GAP1-ACTIVE", "GAP2-ACTIVE", "SUCCESS", "EATEN-1", "EATEN-2"
+(define *drill-status* 'ready) 
+
+;; Helper to format physical button names with authentic controller colors using ~L formats
+(defun format-btn-colored ((btn symbol))
+  (cond
+    ((= btn 'square) "~24L[Square]~0L")
+    ((= btn 'circle) "~25L[Circle]~0L")
+    ((= btn 'triangle) "~26L[Triangle]~0L")
+    ((= btn 'x) "~27L[X]~0L")
+    ((= btn 'l1) "~22L[L1]~0L")
+    ((= btn 'r1) "~22L[R1]~0L")
+    (else "~1L[Button]~0L")
+    )
+  )
 
 ;; 2. Dynamic button-hold helper function
 (defun cpad-hold-by-symbol? ((pad int) (btn symbol))
@@ -59,7 +83,7 @@
     )
   )
 
-;; 3. State-switching REPL Utility
+;; 3. Preset Switcher with Auto-BPM calculations
 (defun tempo-set-drill-presets ((title string) (s1 symbol) (s2 symbol) (s3 symbol) (b1 symbol) (b2 symbol) (b3 symbol))
   (set! *drill-title* title)
   (set! *drill-state-1* s1)
@@ -69,7 +93,7 @@
   (set! *drill-btn-2* b2)
   (set! *drill-btn-3* b3)
   
-  ;; Reset learning registers
+  ;; Reset registers
   (set! *learned-gap1-min* 999)
   (set! *learned-gap1-max* 0)
   (set! *learned-gap2-min* 999)
@@ -81,246 +105,271 @@
   (set! *p3-time* 0)
   (set! *drill-attempts* 0)
   (set! *drill-successes* 0)
-  (set! *drill-status* "WAITING")
-  (format #t "Drill set to: ~S. Execute the move successfully to teach the metronome!~%" title)
+  (set! *drill-status* 'ready)
+  (format #t "Drill preset loaded: ~S~%" title)
   (none)
   )
 
 ;; 4. Define the idle state containing our real-time frame loop
-(defstate tempo-idle (tempo-process)
-  :code (lambda ()
-          (let ((last-beat-idx -1)
-                (last-state 'none)
-                (btn1-was-held #f)
-                (btn2-was-held #f)
-                (btn3-was-held #f)
-                (p2-captured #f)
-                (p3-captured #f)
-                (beat-start-ticks 0)
-                (played-beat-2 #f)
-                (played-beat-3 #f)
+(defstate tempo-coach-idle (tempo-coach-process)
+  ;; CRASH-PROOF & NATIVE: By using GOAL's 'behavior' form instead of 'lambda', 
+  ;; the compiler automatically and safely binds the 'self' symbol to the active process 
+  ;; with full class type casting. This completely eliminates compiler errors and prevents
+  ;; listener process heap corruption!
+  :code (behavior ()
+          ;; Initialize our process fields inside the process' heap instead of local stack frames
+          (set! (-> self last-beat-idx) -1)
+          (set! (-> self last-state) 'none)
+          (set! (-> self btn1-was-held) #f)
+          (set! (-> self btn2-was-held) #f)
+          (set! (-> self btn3-was-held) #f)
+          (set! (-> self p2-captured) #f)
+          (set! (-> self p3-captured) #f)
+          (set! (-> self beat-start-ticks) 0)
+          (set! (-> self played-beat-2) #f)
+          (set! (-> self played-beat-3) #f)
+          (loop
+            (let* ((ticks-per-beat (/ 18000 *tempo-bpm*))
+                   (current-ticks (the int (current-time)))
+                   (beat-idx (/ current-ticks ticks-per-beat))
+                   (tick-in-beat (mod current-ticks ticks-per-beat))
+                   (measure-beat (mod beat-idx *tempo-beats-per-measure*))
+                   
+                   ;; Bouncing Visual Metronome phase calculators
+                   (phase (/ (the float tick-in-beat) (the float ticks-per-beat)))
+                   (bouncer-pos (the int (* phase 14.0)))
+                   )
+              
+              ;; --- 1. TRACK PHYSICAL BUTTON TAP EDGES ---
+              (cond
+                ((cpad-hold-by-symbol? 0 *drill-btn-2*)
+                 (when (and (not (-> self btn2-was-held)) (> *t1* 0) (= *t2* 0) (not (-> self p2-captured)))
+                   (set! *p2-time* current-ticks)
+                   (set! (-> self p2-captured) #t)
+                   )
+                 (set! (-> self btn2-was-held) #t)
+                 )
+                (else
+                 (set! (-> self btn2-was-held) #f)
+                 )
                 )
-            (loop
-              (let* ((ticks-per-beat (/ 18000 *tempo-bpm*))
-                     (current-ticks (the int (current-time)))
-                     (beat-idx (/ current-ticks ticks-per-beat))
-                     (tick-in-beat (mod current-ticks ticks-per-beat))
-                     (measure-beat (mod beat-idx *tempo-beats-per-measure*))
-                     )
-                
-                ;; --- 1. TRACK PHYSICAL BUTTON TAP EDGES ---
-                (cond
-                  ((cpad-hold-by-symbol? 0 *drill-btn-2*)
-                   (when (and (not btn2-was-held) (> *t1* 0) (= *t2* 0) (not p2-captured))
-                     (set! *p2-time* current-ticks)
-                     (set! p2-captured #t)
-                     )
-                   (set! btn2-was-held #t)
+              
+              (cond
+                ((cpad-hold-by-symbol? 0 *drill-btn-3*)
+                 (when (and (not (-> self btn3-was-held)) (> *t2* 0) (= *t3* 0) (not (-> self p3-captured)))
+                   (set! *p3-time* current-ticks)
+                   (set! (-> self p3-captured) #t)
                    )
-                  (else
-                   (set! btn2-was-held #f)
-                   )
-                  )
-                
-                (cond
-                  ((cpad-hold-by-symbol? 0 *drill-btn-3*)
-                   (when (and (not btn3-was-held) (> *t2* 0) (= *t3* 0) (not p3-captured))
-                     (set! *p3-time* current-ticks)
-                     (set! p3-captured #t)
-                     )
-                   (set! btn3-was-held #t)
-                   )
-                  (else
-                   (set! btn3-was-held #f)
-                   )
-                  )
+                 (set! (-> self btn3-was-held) #t)
+                 )
+                (else
+                 (set! (-> self btn3-was-held) #f)
+                 )
+              )
 
-                ;; --- 2. INTERCEPT STATE MACHINE TRANSITIONS ---
-                (when *target*
-                  (let ((s (-> *target* state name)))
-                    (cond
-                      ;; A. Target entered State 1 (Lunge/Start)
-                      ((and (= s *drill-state-1*) (!= last-state *drill-state-1*))
-                       (set! *t1* current-ticks)
-                       (set! *t2* 0)
-                       (set! *t3* 0)
-                       (set! *p2-time* 0)
-                       (set! *p3-time* 0)
-                       (set! p2-captured #f)
-                       (set! p3-captured #f)
-                       (set! *drill-status* "GAP1-ACTIVE")
-                       )
-                      
-                      ;; B. Target entered State 2 (Intermediate)
-                      ((and (= s *drill-state-2*) (!= last-state *drill-state-2*))
-                       (when (string= *drill-status* "GAP1-ACTIVE")
-                         (set! *t2* current-ticks)
-                         (set! *drill-status* "GAP2-ACTIVE")
-                         (let ((gap1-frames (/ (- *t2* *t1*) 5)))
-                           (when (< gap1-frames *learned-gap1-min*) (set! *learned-gap1-min* gap1-frames))
-                           (when (> gap1-frames *learned-gap1-max*) (set! *learned-gap1-max* gap1-frames))
-                           )
+              ;; --- 2. INTERCEPT STATE MACHINE TRANSITIONS ---
+              ;; CRASH-PROOF DOUBLE-GUARD: *target* and its *state* can temporarily be null/dead during level transitions!
+              (when (and *target* (-> *target* state))
+                (let ((s (-> *target* state name)))
+                  (cond
+                    ;; A. Target entered State 1 (Start lunge)
+                    ((and (= s *drill-state-1*) (!= (-> self last-state) *drill-state-1*))
+                     (set! *t1* current-ticks)
+                     (set! *t2* 0)
+                     (set! *t3* 0)
+                     (set! *p2-time* 0)
+                     (set! *p3-time* 0)
+                     (set! (-> self p2-captured) #f)
+                     (set! (-> self p3-captured) #f)
+                     (set! *drill-status* 'gap1-active)
+                     )
+                    
+                    ;; B. Target entered State 2 (Intermediate)
+                    ((and (= s *drill-state-2*) (!= (-> self last-state) *drill-state-2*))
+                     (when (= *drill-status* 'gap1-active)
+                       (set! *t2* current-ticks)
+                       (set! *drill-status* 'gap2-active)
+                       (let ((gap1-frames (/ (- *t2* *t1*) 5)))
+                         (when (< gap1-frames *learned-gap1-min*) (set! *learned-gap1-min* gap1-frames))
+                         (when (> gap1-frames *learned-gap1-max*) (set! *learned-gap1-max* gap1-frames))
                          )
                        )
-                      
-                      ;; C. Target entered State 3 (Completed Trick)
-                      ((and (= s *drill-state-3*) (!= last-state *drill-state-3*))
-                       (when (string= *drill-status* "GAP2-ACTIVE")
-                         (set! *t3* current-ticks)
-                         (set! *drill-status* "SUCCESS")
-                         (set! *drill-attempts* (+ *drill-attempts* 1))
-                         (set! *drill-successes* (+ *drill-successes* 1))
-                         (let ((gap2-frames (/ (- *t3* *t2*) 5)))
-                           (when (< gap2-frames *learned-gap2-min*) (set! *learned-gap2-min* gap2-frames))
-                           (when (> gap2-frames *learned-gap2-max*) (set! *learned-gap2-max* gap2-frames))
-                           )
+                     )
+                    
+                    ;; C. Target entered State 3 (Completed Trick)
+                    ((and (= s *drill-state-3*) (!= (-> self last-state) *drill-state-3*))
+                     (when (= *drill-status* 'gap2-active)
+                       (set! *t3* current-ticks)
+                       (set! *drill-status* 'success)
+                       (set! *drill-attempts* (+ *drill-attempts* 1))
+                       (set! *drill-successes* (+ *drill-successes* 1))
+                       (let ((gap2-frames (/ (- *t3* *t2*) 5)))
+                         (when (< gap2-frames *learned-gap2-min*) (set! *learned-gap2-min* gap2-frames))
+                         (when (> gap2-frames *learned-gap2-max*) (set! *learned-gap2-max* gap2-frames))
                          )
                        )
-                      
-                      ;; D. Handle Crouch Uppercut error state
-                      ((and (or (= s 'target-attack-uppercut) (= s 'target-attack-uppercut-jump)) 
-                            (!= last-state s) (string= *drill-status* "GAP1-ACTIVE"))
-                       (set! *drill-status* "EATEN-UPPERCUT")
-                       (set! *drill-attempts* (+ *drill-attempts* 1))
-                       )
-                      
-                      ;; E. Handle direct Punch Jump error state
-                      ((and (or (= s 'target-jump) (= s 'target-jump-forward)) 
-                            (= last-state 'target-running-attack) (string= *drill-status* "GAP1-ACTIVE"))
-                       (set! *drill-status* "EATEN-PUNCH-JUMP")
-                       (set! *drill-attempts* (+ *drill-attempts* 1))
-                       )
-                      )
-                    (set! last-state s)
+                     )
+                    
+                    ;; D. Handle Crouch Uppercut error
+                    ((and (or (= s 'target-attack-uppercut) (= s 'target-attack-uppercut-jump)) 
+                          (!= (-> self last-state) s) (= *drill-status* 'gap1-active))
+                     (set! *drill-status* 'eaten-uppercut)
+                     (set! *drill-attempts* (+ *drill-attempts* 1))
+                     )
+                    
+                    ;; E. Handle direct Punch Jump error
+                    ((and (or (= s 'target-jump) (= s 'target-jump-forward)) 
+                          (= (-> self last-state) 'target-running-attack) (= *drill-status* 'gap1-active))
+                     (set! *drill-status* 'eaten-punch-jump)
+                     (set! *drill-attempts* (+ *drill-attempts* 1))
+                     )
                     )
+                  (set! (-> self last-state) s)
                   )
-                
-                ;; F. Input Eaten Timeout checks
-                (when (and p2-captured (= *t2* 0) (string= *drill-status* "GAP1-ACTIVE") (> (- current-ticks *p2-time*) 150))
-                  (set! *drill-status* "EATEN-GAP1")
-                  (set! *drill-attempts* (+ *drill-attempts* 1))
-                  )
-                (when (and p3-captured (= *t3* 0) (string= *drill-status* "GAP2-ACTIVE") (> (- current-ticks *p3-time*) 150))
-                  (set! *drill-status* "EATEN-GAP2")
-                  (set! *drill-attempts* (+ *drill-attempts* 1))
-                  )
+                )
+              
+              ;; F. Input Eaten Timeout checks
+              (when (and (-> self p2-captured) (= *t2* 0) (= *drill-status* 'gap1-active) (> (- current-ticks *p2-time*) 150))
+                (set! *drill-status* 'eaten-gap1)
+                (set! *drill-attempts* (+ *drill-attempts* 1))
+                )
+              (when (and (-> self p3-captured) (= *t3* 0) (= *drill-status* 'gap2-active) (> (- current-ticks *p3-time*) 150))
+                (set! *drill-status* 'eaten-gap2)
+                (set! *drill-attempts* (+ *drill-attempts* 1))
+                )
 
-                ;; --- 3. DRAW DYNAMIC HUD INTERFACE ---
-                (format *stdcon* "========================================~%")
-                (format *stdcon* "     SPEEDRUN STATE RHYTHM INSTRUCTOR   ~%")
-                (format *stdcon* "========================================~%")
-                (format *stdcon* " Drill: ~S~%" *drill-title*)
-                (if *target*
-                    (format *stdcon* " Jak Live State: ~A~%" (-> *target* state name))
-                    (format *stdcon* " Jak Live State: OFFLINE~%")
-                    )
-                (format *stdcon* "----------------------------------------~%")
-                
-                ;; Display learned safe windows dynamically
-                (if (= *learned-gap1-min* 999)
-                    (format *stdcon* " Learn: Gap 1 (Button 1 -> 2): ~5LWAITING ON SUCCESS~0L~%" )
-                    (format *stdcon* " Learn: Gap 1 (Button 1 -> 2): ~6L~D to ~D frames~0L~%" 
-                            *learned-gap1-min* *learned-gap1-max*)
-                    )
-                (if (= *learned-gap2-min* 999)
-                    (format *stdcon* " Learn: Gap 2 (Button 2 -> 3): ~5LWAITING ON SUCCESS~0L~%" )
-                    (format *stdcon* " Learn: Gap 2 (Button 2 -> 3): ~6L~D to ~D frames~0L~%" 
-                            *learned-gap2-min* *learned-gap2-max*)
-                    )
-                (format *stdcon* "----------------------------------------~%")
-                
-                ;; Display active timing evaluations
-                (cond
-                  ((string= *drill-status* "WAITING")
-                   (format *stdcon* " Status: ~5LREADY - Press [~A] to start lunge~0L~%" *drill-btn-1*)
-                   )
-                  ((string= *drill-status* "GAP1-ACTIVE")
-                   (format *stdcon* " Status: Lunge started! Tap [~A] next...~%" *drill-btn-2*)
-                   )
-                  ((string= *drill-status* "GAP2-ACTIVE")
-                   (format *stdcon* " Status: Roll active! Tap [~A] next...~%" *drill-btn-3*)
-                   )
-                  ((string= *drill-status* "SUCCESS")
-                   (format *stdcon* " Outcome: ~6LSUCCESSFUL CANCEL!~0L~%")
-                   (format *stdcon* " Timings: Gap1: ~D frames | Gap2: ~D frames~%" 
-                           (/ (- *t2* *t1*) 5) (/ (- *t3* *t2*) 5))
-                   )
-                  ((string= *drill-status* "EATEN-GAP1")
-                   (format *stdcon* " Outcome: ~3LINPUT EATEN!~0L~%")
-                   (format *stdcon* " Timings: Physical tap L1 was at Frame ~D~%" 
-                           (/ (- *p2-time* *t1*) 5))
-                   (format *stdcon* " Coaching: Too fast! Punch lunge lock requires >= 8 frames.~%")
-                   )
-                  ((string= *drill-status* "EATEN-GAP2")
-                   (format *stdcon* " Outcome: ~3LROLL JUMP MISSED!~0L~%")
-                   (format *stdcon* " Timings: Physical tap X was at Frame ~D~%" 
-                           (/ (- *p3-time* *t2*) 5))
-                   (format *stdcon* " Coaching: You missed the target-wheel cancel window.~%")
-                   )
-                  ((string= *drill-status* "EATEN-UPPERCUT")
-                   (format *stdcon* " Outcome: ~3LACCIDENTAL UPPERCUT!~0L~%")
-                   (format *stdcon* " Coaching: You held L1 before pressing Square!~%")
-                   )
-                  ((string= *drill-status* "EATEN-PUNCH-JUMP")
-                   (format *stdcon* " Outcome: ~3LPUNCH JUMP! (Skipped Roll)~0L~%")
-                   (format *stdcon* " Coaching: You pressed Jump before L1 registered.~%")
-                   )
+              ;; --- 3. DRAW POLISHED TRAINING INTERFACE ---
+              (format *stdcon* "========================================~%")
+              (format *stdcon* "       ~6LOPENGAL SPEEDRUN COACH~0L         ~%")
+              (format *stdcon* "========================================~%")
+              (format *stdcon* " Active Drill: ~S~%" *drill-title*)
+              ;; CRASH-PROOF GUARD: Safely print Jak's State only if target and state pointers are valid!
+              (if (and *target* (-> *target* state))
+                  (format *stdcon* " Jak State:    ~8L~A~0L~%" (-> *target* state name))
+                  (format *stdcon* " Jak State:    ~3LOFFLINE~0L~%")
                   )
-                
-                ;; Display session accuracy
-                (format *stdcon* "----------------------------------------~%")
-                (let ((accuracy 0))
-                  (when (> *drill-attempts* 0)
-                    (set! accuracy (/ (* *drill-successes* 100) *drill-attempts*))
+              (format *stdcon* "----------------------------------------~%")
+              
+              ;; THE BOUNCING VISUAL METRONOME LINE
+              (format *stdcon* " Rhythm Tick:  ~D / ~D  |" (+ measure-beat 1) *tempo-beats-per-measure*)
+              (dotimes (i 15)
+                (if (= i bouncer-pos)
+                    (format *stdcon* "~6L*~0L") ;; Green bouncing asterisk
+                    (format *stdcon* " ")
                     )
-                  (format *stdcon* " Accuracy: ~D successes / ~D runs (~D%)~%" 
-                          *drill-successes* *drill-attempts* accuracy)
-                  )
-                (format *stdcon* "========================================~%")
-                
-                ;; --- 4. AUTO-SYNTHESIZED RHYTHM METRONOME ---
-                (when (!= beat-idx last-beat-idx)
-                  (set! last-beat-idx beat-idx)
-                  (when (= measure-beat 0)
-                    ;; Play Beat 1: High-pitched lunge cue (PING)
-                    (sound-play-by-name (static-sound-name "money-pickup") (new-sound-id) 1024 1200 0 (the sound-group 1) #t)
-                    (set! beat-start-ticks current-ticks)
-                    (set! played-beat-2 #f)
-                    (set! played-beat-3 #f)
+                )
+              (format *stdcon* "|~%")
+              (format *stdcon* "----------------------------------------~%")
+
+              ;; DISPLAY LEARNED TIMINGS AND CALCULATED BPM (With dynamic divide-by-zero guards)
+              (if (= *learned-gap1-min* 999)
+                  (format *stdcon* " Gap 1 Window: ~5LWAITING ON SUCCESSFUL EXECUTION~0L~%" )
+                  (let* ((safe-gap1 (if (<= *learned-gap1-min* 0) 1 *learned-gap1-min*))
+                         (calculated-bpm (/ 3600 safe-gap1)))
+                    (format *stdcon* " Gap 1 (1->2): ~6L~D to ~D frames~0L (BPM: ~6L~D~0L)~%" 
+                            *learned-gap1-min* *learned-gap1-max* calculated-bpm)
                     )
                   )
-                
-                ;; Play Beat 2: Scheduled exactly at your learned transition boundary!
-                (when (and (!= *learned-gap1-min* 999) (not played-beat-2))
-                  (let ((target-beat2-ticks (+ beat-start-ticks (* *learned-gap1-min* 5))))
-                    (when (>= current-ticks target-beat2-ticks)
-                      (sound-play-by-name (static-sound-name "money-pickup") (new-sound-id) 1024 200 0 (the sound-group 1) #t)
-                      (set! played-beat-2 #t)
-                      )
+              (if (= *learned-gap2-min* 999)
+                  (format *stdcon* " Gap 2 Window: ~5LWAITING ON SUCCESSFUL EXECUTION~0L~%" )
+                  (let* ((safe-gap2 (if (<= *learned-gap2-min* 0) 1 *learned-gap2-min*))
+                         (calculated-bpm-2 (/ 3600 safe-gap2)))
+                    (format *stdcon* " Gap 2 (2->3): ~6L~D to ~D frames~0L (BPM: ~6L~D~0L)~%" 
+                            *learned-gap2-min* *learned-gap2-max* calculated-bpm-2)
                     )
                   )
-                
-                ;; Play Beat 3: Scheduled exactly at your learned second transition boundary!
-                (when (and (!= *learned-gap2-min* 999) played-beat-2 (not played-beat-3))
-                  (let ((target-beat3-ticks (+ beat-start-ticks (* *learned-gap1-min* 5) (* *learned-gap2-min* 5))))
-                    (when (>= current-ticks target-beat3-ticks)
-                      (sound-play-by-name (static-sound-name "money-pickup") (new-sound-id) 1024 -600 0 (the sound-group 1) #t)
-                      (set! played-beat-3 #t)
-                      )
+              (format *stdcon* "----------------------------------------~%")
+              
+              ;; TIMING EVALUATION COACHING
+              (cond
+                ((= *drill-status* 'ready)
+                 (format *stdcon* " Status: ~5LREADY~0L - Press ~S to start~%" (format-btn-colored *drill-btn-1*))
+                 )
+                ((= *drill-status* 'gap1-active)
+                 (format *stdcon* " Status: First input hit! Tap ~S next...~%" (format-btn-colored *drill-btn-2*))
+                 )
+                ((= *drill-status* 'gap2-active)
+                 (format *stdcon* " Status: Gap 1 complete! Tap ~S next...~%" (format-btn-colored *drill-btn-3*))
+                 )
+                ((= *drill-status* 'success)
+                 (format *stdcon* " Outcome: ~6LSUCCESSFUL EXECUTION!~0L~%")
+                 (format *stdcon* " Spacing: Gap1: ~D frames | Gap2: ~D frames~%" 
+                         (/ (- *t2* *t1*) 5) (/ (- *t3* *t2*) 5))
+                 )
+                ((= *drill-status* 'eaten-gap1)
+                 (format *stdcon* " Outcome: ~3LINPUT EATEN!~0L~%")
+                 (format *stdcon* " Spacing: ~S was tapped at Frame ~D~%" 
+                         (format-btn-colored *drill-btn-2*) (/ (- *p2-time* *t1*) 5))
+                 (format *stdcon* " Coaching: Too fast! Input lockout active on early frames.~%")
+                 )
+                ((= *drill-status* 'eaten-gap2)
+                 (format *stdcon* " Outcome: ~3LCOMBO DROPPED!~0L~%")
+                 (format *stdcon* " Spacing: ~S was tapped at Frame ~D~%" 
+                         (format-btn-colored *drill-btn-3*) (/ (- *p3-time* *t2*) 5))
+                 (format *stdcon* " Coaching: You missed the state-cancel window.~%")
+                 )
+                ((= *drill-status* 'eaten-uppercut)
+                 (format *stdcon* " Outcome: ~3LACCIDENTAL UPPERCUT!~0L~%")
+                 (format *stdcon* " Coaching: You held ~S *before* pressing ~S.~%" 
+                         (format-btn-colored *drill-btn-2*) (format-btn-colored *drill-btn-1*))
+                 )
+                ((= *drill-status* 'eaten-punch-jump)
+                 (format *stdcon* " Outcome: ~3LPUNCH JUMP!~0L~%")
+                 (format *stdcon* " Coaching: ~S was skipped. Lunge cancel failed.~%" 
+                         (format-btn-colored *drill-btn-2*))
+                 )
+                )
+              
+              ;; SESSION STATISTICS
+              (format *stdcon* "----------------------------------------~%")
+              (let ((accuracy 0))
+                (when (> *drill-attempts* 0)
+                  (set! accuracy (/ (* *drill-successes* 100) *drill-attempts*))
+                  )
+                (format *stdcon* " Session: Attempts: ~D | Hits: ~D | Consistency: ~D%~%" 
+                        *drill-attempts* *drill-successes* accuracy)
+                )
+              (format *stdcon* "========================================~%")
+              
+              ;; --- 5. AUDIO SYNTH TRACKER ---
+              (when (!= beat-idx (-> self last-beat-idx))
+                (set! (-> self last-beat-idx) beat-idx)
+                (when (= measure-beat 0)
+                  (sound-play-by-name (static-sound-name "money-pickup") (new-sound-id) 1024 1200 0 (the sound-group 1) #t)
+                  (set! (-> self beat-start-ticks) current-ticks)
+                  (set! (-> self played-beat-2) #f)
+                  (set! (-> self played-beat-3) #f)
+                  )
+                )
+              
+              (when (and (!= *learned-gap1-min* 999) (not (-> self played-beat-2)))
+                (let ((target-beat2-ticks (+ (-> self beat-start-ticks) (* *learned-gap1-min* 5))))
+                  (when (>= current-ticks target-beat2-ticks)
+                    (sound-play-by-name (static-sound-name "money-pickup") (new-sound-id) 1024 200 0 (the sound-group 1) #t)
+                    (set! (-> self played-beat-2) #t)
                     )
                   )
                 )
               
-              ;; Suspend execution until the next frame
-              (suspend)
+              (when (and (!= *learned-gap2-min* 999) (-> self played-beat-2) (not (-> self played-beat-3)))
+                (let ((target-beat3-ticks (+ (-> self beat-start-ticks) (* *learned-gap1-min* 5) (* *learned-gap2-min* 5))))
+                  (when (>= current-ticks target-beat3-ticks)
+                    (sound-play-by-name (static-sound-name "money-pickup") (new-sound-id) 1024 -600 0 (the sound-group 1) #t)
+                    (set! (-> self played-beat-3) #t)
+                    )
+                  )
+                )
               )
+            
+            ;; Suspend execution until the next frame
+            (suspend)
             )
           )
   )
 
 ;; Helper functions to safely start and stop the process
 (defun tempo-stop ()
-  (kill-by-type tempo-process *active-pool*)
+  (kill-by-type tempo-coach-process *active-pool*)
   (set! *tempo-process* (the-as handle #f))
   (format #t "GOAL-Tempo background process stopped cleanly.~%")
   (none)
@@ -339,11 +388,11 @@
   (set! *learned-gap2-max* 0)
   (set! *drill-attempts* 0)
   (set! *drill-successes* 0)
-  (set! *drill-status* "WAITING")
-  (let ((proc (get-process *nk-dead-pool* tempo-process 1024)))
+  (set! *drill-status* 'ready)
+  (let ((proc (get-process *nk-dead-pool* tempo-coach-process 1024)))
     (when proc
       (activate proc *active-pool* 'tempo *kernel-dram-stack*)
-      (run-now-in-process proc (lambda () (go tempo-idle)))
+      (run-now-in-process proc (lambda () (go tempo-coach-idle)))
       (set! *tempo-process* (process->handle proc))
       (format #t "GOAL-Tempo background process started!~%")
       )
