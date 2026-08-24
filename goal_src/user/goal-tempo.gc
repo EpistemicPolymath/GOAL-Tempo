@@ -8,22 +8,25 @@
 ;; Global variables to track state
 (define *tempo-process* (the-as handle #f))
 (define *tempo-bpm* 120)
-(define *tempo-beats-per-measure* 4)
+(define *tempo-beats-per-measure* 3) ;; 3 beats: Punch (1) -> Roll (2) -> Jump (3)
 
-;; --- DYNAMIC DRILL CONFIGURATION ---
-(define *tempo-drill-name* "Punch -> Roll Jump")
-(define *tempo-btn-1* 'square)        ;; First input to register
-(define *tempo-btn-2* 'l1)            ;; Primary second input
-(define *tempo-btn-2-alt* 'x)         ;; Optional alternate second input (e.g. L1 or X)
-(define *tempo-target-min-frames* 2)  ;; Lower bound of perfect execution window
-(define *tempo-target-max-frames* 5)  ;; Upper bound of perfect execution window
+;; Timestamp registers (300Hz ticks)
+(define *punch-time* 0)
+(define *roll-time* 0)
+(define *jump-time* 0)
 
-;; Training State Variables
-(define *first-input-time* 0)
-(define *second-input-time* 0)
-(define *last-gap-ticks* 0)
-(define *last-gap-frames* 0)
-(define *combo-success* #f)
+;; Physical input frame offsets (relative to the start of the previous state)
+(define *l1-physical-press-frame* 0)
+(define *x-physical-press-frame* 0)
+
+;; State-machine evaluation registers
+(define *punch-to-roll-frames* 0)
+(define *roll-to-jump-frames* 0)
+(define *had-running-attack* #f)
+(define *had-wheel* #f)
+(define *had-flip* #f)
+(define *had-uppercut* #f)
+(define *had-punch-jump* #f)
 
 ;; 2. Dynamic button-hold helper function
 (defun cpad-hold-by-symbol? ((pad int) (btn symbol))
@@ -48,9 +51,10 @@
 (defstate tempo-idle (tempo-process)
   :code (lambda ()
           (let ((last-beat-idx -1)
-                (btn1-was-held #f)
-                (btn2-was-held #f)
-                (btn2-captured #f)
+                (last-state 'none)
+                (square-was-held #f)
+                (l1-was-held #f)
+                (x-was-held #f)
                 )
             (loop
               ;; Calculate ticks per beat (300 ticks/sec * 60 sec = 18000 ticks/min)
@@ -61,103 +65,180 @@
                      (measure-beat (mod beat-idx *tempo-beats-per-measure*))
                      )
                 
-                ;; --- 1. DYNAMIC INPUT CAPTURE ---
-                
-                ;; Detect the first frame of Input 1
+                ;; --- 1. TRACK PHYSICAL BUTTON TAPS (RISING EDGES) ---
                 (cond
-                  ((cpad-hold-by-symbol? 0 *tempo-btn-1*)
-                   (when (not btn1-was-held)
-                     (set! *first-input-time* current-ticks)
-                     (set! btn1-was-held #t)
-                     (set! btn2-captured #f)
+                  ((cpad-hold? 0 l1)
+                   (when (and (not l1-was-held) (> *punch-time* 0) (= *roll-time* 0))
+                     ;; Log how many frames after the punch you physically pressed L1
+                     (set! *l1-physical-press-frame* (/ (- current-ticks *punch-time*) 5))
                      )
+                   (set! l1-was-held #t)
                    )
                   (else
-                   (set! btn1-was-held #f)
+                   (set! l1-was-held #f)
                    )
-                )
+                  )
                 
-                ;; Detect the first frame of Input 2 (or its alternate) after Input 1
                 (cond
-                  ((or (cpad-hold-by-symbol? 0 *tempo-btn-2*)
-                       (cpad-hold-by-symbol? 0 *tempo-btn-2-alt*))
-                   (when (and (not btn2-was-held) (> *first-input-time* 0) (not btn2-captured))
-                     (set! *second-input-time* current-ticks)
-                     (set! *last-gap-ticks* (- *second-input-time* *first-input-time*))
-                     ;; 5 ticks = 1 frame (300 ticks/sec / 60 frames/sec)
-                     (set! *last-gap-frames* (/ *last-gap-ticks* 5)) 
-                     (set! btn2-captured #t)
-                     
-                     ;; Evaluate target timing window dynamically
-                     (if (and (>= *last-gap-frames* *tempo-target-min-frames*)
-                              (<= *last-gap-frames* *tempo-target-max-frames*))
-                         (set! *combo-success* #t)
-                         (set! *combo-success* #f)
-                         )
+                  ((cpad-hold? 0 x)
+                   (when (and (not x-was-held) (> *roll-time* 0) (= *jump-time* 0))
+                     ;; Log how many frames after the roll you physically pressed X
+                     (set! *x-physical-press-frame* (/ (- current-ticks *roll-time*) 5))
                      )
-                   (set! btn2-was-held #t)
+                   (set! x-was-held #t)
                    )
                   (else
-                   (set! btn2-was-held #f)
+                   (set! x-was-held #f)
                    )
-                )
-                
-                ;; --- 2. DRAW TRAINER DASHBOARD OVERLAY ---
-                ;; Formatting colors: ~3L = Red, ~5L = Yellow, ~6L = Green, ~0L = Default
-                (format *stdcon* "========================================~%")
-                (format *stdcon* "        GOAL-TEMPO METRONOME LIVE       ~%")
-                (format *stdcon* "========================================~%")
-                (format *stdcon* "BPM: ~D  |  Measure: ~D / ~D~%" 
-                        *tempo-bpm* (+ measure-beat 1) *tempo-beats-per-measure*)
-                
-                (format *stdcon* "----------------------------------------~%")
-                (format *stdcon* "       MOVEMENT TECH COMBO DRILLS       ~%")
-                (format *stdcon* " Target: ~S (~A -> ~A)~%" 
-                        *tempo-drill-name* *tempo-btn-1* *tempo-btn-2*)
-                (format *stdcon* " Goal Window: ~D to ~D frames~%" 
-                        *tempo-target-min-frames* *tempo-target-max-frames*)
-                (format *stdcon* "----------------------------------------~%")
-                
-                (if (= *first-input-time* 0)
-                    (format *stdcon* "Status: ~5LWAITING FOR FIRST INPUT [~A]~0L~%" *tempo-btn-1*)
-                    (begin
-                      (format *stdcon* "Input [~A] registered at: ~D ticks~%" *tempo-btn-1* *first-input-time*)
-                      (if (= *second-input-time* 0)
-                          (format *stdcon* "Status: ~5LFirst input hit! Press [~A] next...~0L~%" *tempo-btn-2*)
-                          (begin
-                            (format *stdcon* "Input [~A] registered at: ~D ticks~%" *tempo-btn-2* *second-input-time*)
-                            (format *stdcon* "Interval: ~D ticks (~D frames)~%" *last-gap-ticks* *last-gap-frames*)
-                            
-                            ;; Output real-time coaching using our dynamic criteria
-                            (cond
-                              ((< *last-gap-frames* *tempo-target-min-frames*)
-                               (format *stdcon* "Evaluation: ~3LTOO FAST! (~D frames)~0L~%" *last-gap-frames*)
-                               (format *stdcon* "Coaching: Slow down your second input.~%")
-                               )
-                               (*combo-success*
-                               (format *stdcon* "Evaluation: ~6LPERFECT TIMING! (~D frames)~0L~%" *last-gap-frames*)
-                               (format *stdcon* "Coaching: Great muscle memory! Keep drilling.~%")
-                               )
-                              (else
-                               (format *stdcon* "Evaluation: ~3LTOO SLOW! (~D frames)~0L~%" *last-gap-frames*)
-                               (format *stdcon* "Coaching: Speed up your fingers.~%")
-                               )
-                              )
-                            )
-                          )
+                  )
+
+                ;; --- 2. INTERCEPT ENGINE STATE MACHINE TRANSITIONS ---
+                (when *target*
+                  (let ((s (-> *target* state name)))
+                    (cond
+                      ;; A. Jak starts Punch Lunge
+                      ((and (= s 'target-running-attack) (!= last-state 'target-running-attack))
+                       (set! *punch-time* current-ticks)
+                       (set! *roll-time* 0)
+                       (set! *jump-time* 0)
+                       (set! *l1-physical-press-frame* 0)
+                       (set! *x-physical-press-frame* 0)
+                       (set! *punch-to-roll-frames* 0)
+                       (set! *roll-to-jump-frames* 0)
+                       (set! *had-running-attack* #t)
+                       (set! *had-wheel* #f)
+                       (set! *had-flip* #f)
+                       (set! *had-uppercut* #f)
+                       (set! *had-punch-jump* #f)
+                       )
+                      
+                      ;; B. Jak successfully transitions to Roll
+                      ((and (= s 'target-wheel) (!= last-state 'target-wheel))
+                       (set! *roll-time* current-ticks)
+                       (set! *punch-to-roll-frames* (/ (- *roll-time* *punch-time*) 5))
+                       (set! *had-wheel* #t)
+                       )
+                      
+                      ;; C. Jak successfully transitions to Roll Jump
+                      ((and (= s 'target-flip) (!= last-state 'target-flip))
+                       (set! *jump-time* current-ticks)
+                       (set! *roll-to-jump-frames* (/ (- *jump-time* *roll-time*) 5))
+                       (set! *had-flip* #t)
+                       )
+                      
+                      ;; D. Error State: Accidental Uppercut
+                      ((and (or (= s 'target-attack-uppercut) (= s 'target-attack-uppercut-jump)) 
+                            (!= last-state s))
+                       (set! *had-uppercut* #t)
+                       )
+                      
+                      ;; E. Error State: Punch Jump (Skipped Roll)
+                      ((and (or (= s 'target-jump) (= s 'target-jump-forward)) 
+                            (= last-state 'target-running-attack))
+                       (set! *had-punch-jump* #t)
+                       )
                       )
+                    (set! last-state s)
                     )
-                (format *stdcon* "========================================~%")
+                  )
+
+                ;; --- 3. DRAW DYNAMIC DIAGNOSTIC INTERFACE ---
+                ;; Colors: ~3L = Red, ~5L = Yellow, ~6L = Green, ~0L = Default
+                (format *stdcon* "========================================~% ")
+                (format *stdcon* "      SPEEDRUN PUNCH-ROLL-JUMP COACH     ~% ")
+                (format *stdcon* "========================================~% ")
+                (if *target*
+                    (format *stdcon* " Jak Live Physics State: ~A~% " (-> *target* state name))
+                    (format *stdcon* " Jak Live Physics State: OFFLINE~% ")
+                    )
+                (format *stdcon* "----------------------------------------~% ")
                 
-                ;; --- 3. ACCENTED AUDIBLE METRONOME ---
+                ;; STAGE 1: PUNCH TO ROLL LUNGE CANCEL
+                (cond
+                  ((= *punch-time* 0)
+                   (format *stdcon* "Punch -> Roll: ~5LWAITING FOR PUNCH [Square]~0L~% ")
+                   )
+                  ((= *roll-time* 0)
+                   (format *stdcon* "Punch -> Roll: ~5LSLIDING (Tap L1)...~0L~% ")
+                   (if (> *l1-physical-press-frame* 0)
+                       (format *stdcon* "  Physical L1 Tap: Frame ~D (~3LEATEN - Too fast!~0L)~% " 
+                               *l1-physical-press-frame*)
+                       )
+                   )
+                  (else
+                   (if (and (>= *punch-to-roll-frames* 8) (<= *punch-to-roll-frames* 15))
+                       (format *stdcon* "Punch -> Roll: ~6LSUCCESS~0L (Canceled at Frame ~D)~% " 
+                               *punch-to-roll-frames*)
+                       (format *stdcon* "Punch -> Roll: ~3LSLOPPY~0L (Canceled at Frame ~D)~% " 
+                               *punch-to-roll-frames*)
+                       )
+                   )
+                  )
+                
+                ;; STAGE 2: ROLL TO FLIP JUMP CANCEL
+                (cond
+                  ((= *roll-time* 0)
+                   (format *stdcon* "Roll  -> Jump: WAITING FOR VALID ROLL~% ")
+                   )
+                  ((= *jump-time* 0)
+                   (format *stdcon* "Roll  -> Jump: ~5LROLLING (Tap X)!~0L~% ")
+                   (if (> *x-physical-press-frame* 0)
+                       (format *stdcon* "  Physical X Tap:  Frame ~D~% " *x-physical-press-frame*)
+                       )
+                   )
+                  (else
+                   (if (and (>= *roll-to-jump-frames* 1) (<= *roll-to-jump-frames* 5))
+                       (format *stdcon* "Roll  -> Jump: ~6LFLAWLESS FLIP~0L (Canceled at Frame ~D)~% " 
+                               *roll-to-jump-frames*)
+                       (format *stdcon* "Roll  -> Jump: ~5LSLOW FLIP~0L (Canceled at Frame ~D)~% " 
+                               *roll-to-jump-frames*)
+                       )
+                   )
+                  )
+                
+                ;; --- 4. REAL-TIME CALIBRATION FEEDBACK ---
+                (format *stdcon* "----------------------------------------~% ")
+                (cond
+                  (*had-uppercut*
+                   (format *stdcon* "~3LUPPERCUT DETECTED!~0L~% ")
+                   (format *stdcon* "Feedback: You held L1 *before* punching.~% ")
+                   (format *stdcon* "Fix: Tap Square FIRST, then slide to L1.~% ")
+                   )
+                  (*had-punch-jump*
+                   (format *stdcon* "~3LPUNCH JUMP DETECTED!~0L~% ")
+                   (format *stdcon* "Feedback: You jumped directly from the punch.~% ")
+                   (format *stdcon* "Fix: Your L1 lunge cancel was skipped or eaten.~% ")
+                   )
+                  ((and (> *punch-time* 0) (= *roll-time* 0) (> *l1-physical-press-frame* 0))
+                   (format *stdcon* "~3LINPUT WAS EATEN!~0L~% ")
+                   (format *stdcon* "Feedback: Physical L1 was tapped on Frame ~D.~% " *l1-physical-press-frame*)
+                   (format *stdcon* "Fix: Frame 0-7 is locked out. Wait until Frame 8-15.~% ")
+                   )
+                  (*had-flip*
+                   (format *stdcon* "~6LEXTENDED ROLL JUMP REGISTERED!~0L~% ")
+                   (format *stdcon* "Excellent execution. Record this feeling!~% ")
+                   )
+                  )
+                (format *stdcon* "========================================~% ")
+                
+                ;; --- 5. AUDIBLE RHYTHM METRONOME (450 BPM) ---
+                ;; 450 BPM maps perfectly to the timing profile of a physical slide-tap!
                 (when (!= beat-idx last-beat-idx)
                   (set! last-beat-idx beat-idx)
-                  (if (= measure-beat 0)
-                      ;; Beat 1: High pitch ping
-                      (sound-play-by-name (static-sound-name "money-pickup") (new-sound-id) 1024 1200 0 (the sound-group 1) #t)
-                      ;; Beats 2-4: Low pitch tick
-                      (sound-play-by-name (static-sound-name "money-pickup") (new-sound-id) 1024 -200 0 (the sound-group 1) #t)
-                      )
+                  (cond
+                    ((= measure-beat 0)
+                     ;; Beat 1: High-pitched lunge cue (Press Square)
+                     (sound-play-by-name (static-sound-name "money-pickup") (new-sound-id) 1024 1000 0 (the sound-group 1) #t)
+                     )
+                    ((= measure-beat 1)
+                     ;; Beat 2: Mid-pitched roll cue (Press L1)
+                     (sound-play-by-name (static-sound-name "money-pickup") (new-sound-id) 1024 200 0 (the sound-group 1) #t)
+                     )
+                    ((= measure-beat 2)
+                     ;; Beat 3: Low-pitched jump cue (Press X)
+                     (sound-play-by-name (static-sound-name "money-pickup") (new-sound-id) 1024 -600 0 (the sound-group 1) #t)
+                     )
+                    )
                   )
                 )
               
@@ -179,11 +260,18 @@
 (defun tempo-start ()
   (tempo-stop)
   ;; Reset states on start
-  (set! *first-input-time* 0)
-  (set! *second-input-time* 0)
-  (set! *last-gap-ticks* 0)
-  (set! *last-gap-frames* 0)
-  (set! *combo-success* #f)
+  (set! *punch-time* 0)
+  (set! *roll-time* 0)
+  (set! *jump-time* 0)
+  (set! *l1-physical-press-frame* 0)
+  (set! *x-physical-press-frame* 0)
+  (set! *punch-to-roll-frames* 0)
+  (set! *roll-to-jump-frames* 0)
+  (set! *had-running-attack* #f)
+  (set! *had-wheel* #f)
+  (set! *had-flip* #f)
+  (set! *had-uppercut* #f)
+  (set! *had-punch-jump* #f)
   (let ((proc (get-process *nk-dead-pool* tempo-process 1024)))
     (when proc
       (activate proc *active-pool* 'tempo *kernel-dram-stack*)
