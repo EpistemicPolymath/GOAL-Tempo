@@ -8,25 +8,37 @@
 ;; Global variables to track state
 (define *tempo-process* (the-as handle #f))
 (define *tempo-bpm* 120)
-(define *tempo-beats-per-measure* 3) ;; 3 beats: Punch (1) -> Roll (2) -> Jump (3)
+(define *tempo-beats-per-measure* 3) ;; 3 beats: Downbeat -> Gap 1 Echo -> Gap 2 Echo
 
-;; Timestamp registers (300Hz ticks)
-(define *punch-time* 0)
-(define *roll-time* 0)
-(define *jump-time* 0)
+;; --- DYNAMIC DRILL BLUEPRINT ---
+(define *drill-title* "Punch-Roll-Jump (PRJ)")
+(define *drill-state-1* 'target-running-attack)
+(define *drill-state-2* 'target-wheel)
+(define *drill-state-3* 'target-wheel-flip) ;; FIXED: Corrected from target-flip to target-wheel-flip!
 
-;; Physical input frame offsets (relative to the start of the previous state)
-(define *l1-physical-press-frame* 0)
-(define *x-physical-press-frame* 0)
+(define *drill-btn-1* 'square)
+(define *drill-btn-2* 'l1)
+(define *drill-btn-3* 'x)
 
-;; State-machine evaluation registers
-(define *punch-to-roll-frames* 0)
-(define *roll-to-jump-frames* 0)
-(define *had-running-attack* #f)
-(define *had-wheel* #f)
-(define *had-flip* #f)
-(define *had-uppercut* #f)
-(define *had-punch-jump* #f)
+;; Learned state-machine bounds (Auto-updated in real-time)
+(define *learned-gap1-min* 999)
+(define *learned-gap1-max* 0)
+(define *learned-gap2-min* 999)
+(define *learned-gap2-max* 0)
+
+;; State Transition Timestamps (300Hz ticks)
+(define *t1* 0)
+(define *t2* 0)
+(define *t3* 0)
+
+;; Physical Input Timestamps
+(define *p2-time* 0)
+(define *p3-time* 0)
+
+;; Session Tracker Stats
+(define *drill-attempts* 0)
+(define *drill-successes* 0)
+(define *drill-status* "WAITING") ;; "WAITING", "GAP1-ACTIVE", "GAP2-ACTIVE", "SUCCESS", "EATEN-1", "EATEN-2"
 
 ;; 2. Dynamic button-hold helper function
 (defun cpad-hold-by-symbol? ((pad int) (btn symbol))
@@ -47,17 +59,48 @@
     )
   )
 
-;; 3. Define the idle state containing our real-time frame loop
+;; 3. State-switching REPL Utility
+(defun tempo-set-drill-presets ((title string) (s1 symbol) (s2 symbol) (s3 symbol) (b1 symbol) (b2 symbol) (b3 symbol))
+  (set! *drill-title* title)
+  (set! *drill-state-1* s1)
+  (set! *drill-state-2* s2)
+  (set! *drill-state-3* s3)
+  (set! *drill-btn-1* b1)
+  (set! *drill-btn-2* b2)
+  (set! *drill-btn-3* b3)
+  
+  ;; Reset learning registers
+  (set! *learned-gap1-min* 999)
+  (set! *learned-gap1-max* 0)
+  (set! *learned-gap2-min* 999)
+  (set! *learned-gap2-max* 0)
+  (set! *t1* 0)
+  (set! *t2* 0)
+  (set! *t3* 0)
+  (set! *p2-time* 0)
+  (set! *p3-time* 0)
+  (set! *drill-attempts* 0)
+  (set! *drill-successes* 0)
+  (set! *drill-status* "WAITING")
+  (format #t "Drill set to: ~S. Execute the move successfully to teach the metronome!~%" title)
+  (none)
+  )
+
+;; 4. Define the idle state containing our real-time frame loop
 (defstate tempo-idle (tempo-process)
   :code (lambda ()
           (let ((last-beat-idx -1)
                 (last-state 'none)
-                (square-was-held #f)
-                (l1-was-held #f)
-                (x-was-held #f)
+                (btn1-was-held #f)
+                (btn2-was-held #f)
+                (btn3-was-held #f)
+                (p2-captured #f)
+                (p3-captured #f)
+                (beat-start-ticks 0)
+                (played-beat-2 #f)
+                (played-beat-3 #f)
                 )
             (loop
-              ;; Calculate ticks per beat (300 ticks/sec * 60 sec = 18000 ticks/min)
               (let* ((ticks-per-beat (/ 18000 *tempo-bpm*))
                      (current-ticks (the int (current-time)))
                      (beat-idx (/ current-ticks ticks-per-beat))
@@ -65,179 +108,205 @@
                      (measure-beat (mod beat-idx *tempo-beats-per-measure*))
                      )
                 
-                ;; --- 1. TRACK PHYSICAL BUTTON TAPS (RISING EDGES) ---
+                ;; --- 1. TRACK PHYSICAL BUTTON TAP EDGES ---
                 (cond
-                  ((cpad-hold? 0 l1)
-                   (when (and (not l1-was-held) (> *punch-time* 0) (= *roll-time* 0))
-                     ;; Log how many frames after the punch you physically pressed L1
-                     (set! *l1-physical-press-frame* (/ (- current-ticks *punch-time*) 5))
+                  ((cpad-hold-by-symbol? 0 *drill-btn-2*)
+                   (when (and (not btn2-was-held) (> *t1* 0) (= *t2* 0) (not p2-captured))
+                     (set! *p2-time* current-ticks)
+                     (set! p2-captured #t)
                      )
-                   (set! l1-was-held #t)
+                   (set! btn2-was-held #t)
                    )
                   (else
-                   (set! l1-was-held #f)
+                   (set! btn2-was-held #f)
                    )
                   )
                 
                 (cond
-                  ((cpad-hold? 0 x)
-                   (when (and (not x-was-held) (> *roll-time* 0) (= *jump-time* 0))
-                     ;; Log how many frames after the roll you physically pressed X
-                     (set! *x-physical-press-frame* (/ (- current-ticks *roll-time*) 5))
+                  ((cpad-hold-by-symbol? 0 *drill-btn-3*)
+                   (when (and (not btn3-was-held) (> *t2* 0) (= *t3* 0) (not p3-captured))
+                     (set! *p3-time* current-ticks)
+                     (set! p3-captured #t)
                      )
-                   (set! x-was-held #t)
+                   (set! btn3-was-held #t)
                    )
                   (else
-                   (set! x-was-held #f)
+                   (set! btn3-was-held #f)
                    )
                   )
 
-                ;; --- 2. INTERCEPT ENGINE STATE MACHINE TRANSITIONS ---
+                ;; --- 2. INTERCEPT STATE MACHINE TRANSITIONS ---
                 (when *target*
                   (let ((s (-> *target* state name)))
                     (cond
-                      ;; A. Jak starts Punch Lunge
-                      ((and (= s 'target-running-attack) (!= last-state 'target-running-attack))
-                       (set! *punch-time* current-ticks)
-                       (set! *roll-time* 0)
-                       (set! *jump-time* 0)
-                       (set! *l1-physical-press-frame* 0)
-                       (set! *x-physical-press-frame* 0)
-                       (set! *punch-to-roll-frames* 0)
-                       (set! *roll-to-jump-frames* 0)
-                       (set! *had-running-attack* #t)
-                       (set! *had-wheel* #f)
-                       (set! *had-flip* #f)
-                       (set! *had-uppercut* #f)
-                       (set! *had-punch-jump* #f)
+                      ;; A. Target entered State 1 (Lunge/Start)
+                      ((and (= s *drill-state-1*) (!= last-state *drill-state-1*))
+                       (set! *t1* current-ticks)
+                       (set! *t2* 0)
+                       (set! *t3* 0)
+                       (set! *p2-time* 0)
+                       (set! *p3-time* 0)
+                       (set! p2-captured #f)
+                       (set! p3-captured #f)
+                       (set! *drill-status* "GAP1-ACTIVE")
                        )
                       
-                      ;; B. Jak successfully transitions to Roll
-                      ((and (= s 'target-wheel) (!= last-state 'target-wheel))
-                       (set! *roll-time* current-ticks)
-                       (set! *punch-to-roll-frames* (/ (- *roll-time* *punch-time*) 5))
-                       (set! *had-wheel* #t)
+                      ;; B. Target entered State 2 (Intermediate)
+                      ((and (= s *drill-state-2*) (!= last-state *drill-state-2*))
+                       (when (string= *drill-status* "GAP1-ACTIVE")
+                         (set! *t2* current-ticks)
+                         (set! *drill-status* "GAP2-ACTIVE")
+                         (let ((gap1-frames (/ (- *t2* *t1*) 5)))
+                           (when (< gap1-frames *learned-gap1-min*) (set! *learned-gap1-min* gap1-frames))
+                           (when (> gap1-frames *learned-gap1-max*) (set! *learned-gap1-max* gap1-frames))
+                           )
+                         )
                        )
                       
-                      ;; C. Jak successfully transitions to Roll Jump
-                      ((and (= s 'target-flip) (!= last-state 'target-flip))
-                       (set! *jump-time* current-ticks)
-                       (set! *roll-to-jump-frames* (/ (- *jump-time* *roll-time*) 5))
-                       (set! *had-flip* #t)
+                      ;; C. Target entered State 3 (Completed Trick)
+                      ((and (= s *drill-state-3*) (!= last-state *drill-state-3*))
+                       (when (string= *drill-status* "GAP2-ACTIVE")
+                         (set! *t3* current-ticks)
+                         (set! *drill-status* "SUCCESS")
+                         (set! *drill-attempts* (+ *drill-attempts* 1))
+                         (set! *drill-successes* (+ *drill-successes* 1))
+                         (let ((gap2-frames (/ (- *t3* *t2*) 5)))
+                           (when (< gap2-frames *learned-gap2-min*) (set! *learned-gap2-min* gap2-frames))
+                           (when (> gap2-frames *learned-gap2-max*) (set! *learned-gap2-max* gap2-frames))
+                           )
+                         )
                        )
                       
-                      ;; D. Error State: Accidental Uppercut
+                      ;; D. Handle Crouch Uppercut error state
                       ((and (or (= s 'target-attack-uppercut) (= s 'target-attack-uppercut-jump)) 
-                            (!= last-state s))
-                       (set! *had-uppercut* #t)
+                            (!= last-state s) (string= *drill-status* "GAP1-ACTIVE"))
+                       (set! *drill-status* "EATEN-UPPERCUT")
+                       (set! *drill-attempts* (+ *drill-attempts* 1))
                        )
                       
-                      ;; E. Error State: Punch Jump (Skipped Roll)
+                      ;; E. Handle direct Punch Jump error state
                       ((and (or (= s 'target-jump) (= s 'target-jump-forward)) 
-                            (= last-state 'target-running-attack))
-                       (set! *had-punch-jump* #t)
+                            (= last-state 'target-running-attack) (string= *drill-status* "GAP1-ACTIVE"))
+                       (set! *drill-status* "EATEN-PUNCH-JUMP")
+                       (set! *drill-attempts* (+ *drill-attempts* 1))
                        )
                       )
                     (set! last-state s)
                     )
                   )
+                
+                ;; F. Input Eaten Timeout checks
+                (when (and p2-captured (= *t2* 0) (string= *drill-status* "GAP1-ACTIVE") (> (- current-ticks *p2-time*) 150))
+                  (set! *drill-status* "EATEN-GAP1")
+                  (set! *drill-attempts* (+ *drill-attempts* 1))
+                  )
+                (when (and p3-captured (= *t3* 0) (string= *drill-status* "GAP2-ACTIVE") (> (- current-ticks *p3-time*) 150))
+                  (set! *drill-status* "EATEN-GAP2")
+                  (set! *drill-attempts* (+ *drill-attempts* 1))
+                  )
 
-                ;; --- 3. DRAW DYNAMIC DIAGNOSTIC INTERFACE ---
-                ;; Colors: ~3L = Red, ~5L = Yellow, ~6L = Green, ~0L = Default
-                (format *stdcon* "========================================~% ")
-                (format *stdcon* "      SPEEDRUN PUNCH-ROLL-JUMP COACH     ~% ")
-                (format *stdcon* "========================================~% ")
+                ;; --- 3. DRAW DYNAMIC HUD INTERFACE ---
+                (format *stdcon* "========================================~%")
+                (format *stdcon* "     SPEEDRUN STATE RHYTHM INSTRUCTOR   ~%")
+                (format *stdcon* "========================================~%")
+                (format *stdcon* " Drill: ~S~%" *drill-title*)
                 (if *target*
-                    (format *stdcon* " Jak Live Physics State: ~A~% " (-> *target* state name))
-                    (format *stdcon* " Jak Live Physics State: OFFLINE~% ")
+                    (format *stdcon* " Jak Live State: ~A~%" (-> *target* state name))
+                    (format *stdcon* " Jak Live State: OFFLINE~%")
                     )
-                (format *stdcon* "----------------------------------------~% ")
+                (format *stdcon* "----------------------------------------~%")
                 
-                ;; STAGE 1: PUNCH TO ROLL LUNGE CANCEL
+                ;; Display learned safe windows dynamically
+                (if (= *learned-gap1-min* 999)
+                    (format *stdcon* " Learn: Gap 1 (Button 1 -> 2): ~5LWAITING ON SUCCESS~0L~%" )
+                    (format *stdcon* " Learn: Gap 1 (Button 1 -> 2): ~6L~D to ~D frames~0L~%" 
+                            *learned-gap1-min* *learned-gap1-max*)
+                    )
+                (if (= *learned-gap2-min* 999)
+                    (format *stdcon* " Learn: Gap 2 (Button 2 -> 3): ~5LWAITING ON SUCCESS~0L~%" )
+                    (format *stdcon* " Learn: Gap 2 (Button 2 -> 3): ~6L~D to ~D frames~0L~%" 
+                            *learned-gap2-min* *learned-gap2-max*)
+                    )
+                (format *stdcon* "----------------------------------------~%")
+                
+                ;; Display active timing evaluations
                 (cond
-                  ((= *punch-time* 0)
-                   (format *stdcon* "Punch -> Roll: ~5LWAITING FOR PUNCH [Square]~0L~% ")
+                  ((string= *drill-status* "WAITING")
+                   (format *stdcon* " Status: ~5LREADY - Press [~A] to start lunge~0L~%" *drill-btn-1*)
                    )
-                  ((= *roll-time* 0)
-                   (format *stdcon* "Punch -> Roll: ~5LSLIDING (Tap L1)...~0L~% ")
-                   (if (> *l1-physical-press-frame* 0)
-                       (format *stdcon* "  Physical L1 Tap: Frame ~D (~3LEATEN - Too fast!~0L)~% " 
-                               *l1-physical-press-frame*)
-                       )
+                  ((string= *drill-status* "GAP1-ACTIVE")
+                   (format *stdcon* " Status: Lunge started! Tap [~A] next...~%" *drill-btn-2*)
                    )
-                  (else
-                   (if (and (>= *punch-to-roll-frames* 8) (<= *punch-to-roll-frames* 15))
-                       (format *stdcon* "Punch -> Roll: ~6LSUCCESS~0L (Canceled at Frame ~D)~% " 
-                               *punch-to-roll-frames*)
-                       (format *stdcon* "Punch -> Roll: ~3LSLOPPY~0L (Canceled at Frame ~D)~% " 
-                               *punch-to-roll-frames*)
-                       )
+                  ((string= *drill-status* "GAP2-ACTIVE")
+                   (format *stdcon* " Status: Roll active! Tap [~A] next...~%" *drill-btn-3*)
+                   )
+                  ((string= *drill-status* "SUCCESS")
+                   (format *stdcon* " Outcome: ~6LSUCCESSFUL CANCEL!~0L~%")
+                   (format *stdcon* " Timings: Gap1: ~D frames | Gap2: ~D frames~%" 
+                           (/ (- *t2* *t1*) 5) (/ (- *t3* *t2*) 5))
+                   )
+                  ((string= *drill-status* "EATEN-GAP1")
+                   (format *stdcon* " Outcome: ~3LINPUT EATEN!~0L~%")
+                   (format *stdcon* " Timings: Physical tap L1 was at Frame ~D~%" 
+                           (/ (- *p2-time* *t1*) 5))
+                   (format *stdcon* " Coaching: Too fast! Punch lunge lock requires >= 8 frames.~%")
+                   )
+                  ((string= *drill-status* "EATEN-GAP2")
+                   (format *stdcon* " Outcome: ~3LROLL JUMP MISSED!~0L~%")
+                   (format *stdcon* " Timings: Physical tap X was at Frame ~D~%" 
+                           (/ (- *p3-time* *t2*) 5))
+                   (format *stdcon* " Coaching: You missed the target-wheel cancel window.~%")
+                   )
+                  ((string= *drill-status* "EATEN-UPPERCUT")
+                   (format *stdcon* " Outcome: ~3LACCIDENTAL UPPERCUT!~0L~%")
+                   (format *stdcon* " Coaching: You held L1 before pressing Square!~%")
+                   )
+                  ((string= *drill-status* "EATEN-PUNCH-JUMP")
+                   (format *stdcon* " Outcome: ~3LPUNCH JUMP! (Skipped Roll)~0L~%")
+                   (format *stdcon* " Coaching: You pressed Jump before L1 registered.~%")
                    )
                   )
                 
-                ;; STAGE 2: ROLL TO FLIP JUMP CANCEL
-                (cond
-                  ((= *roll-time* 0)
-                   (format *stdcon* "Roll  -> Jump: WAITING FOR VALID ROLL~% ")
-                   )
-                  ((= *jump-time* 0)
-                   (format *stdcon* "Roll  -> Jump: ~5LROLLING (Tap X)!~0L~% ")
-                   (if (> *x-physical-press-frame* 0)
-                       (format *stdcon* "  Physical X Tap:  Frame ~D~% " *x-physical-press-frame*)
-                       )
-                   )
-                  (else
-                   (if (and (>= *roll-to-jump-frames* 1) (<= *roll-to-jump-frames* 5))
-                       (format *stdcon* "Roll  -> Jump: ~6LFLAWLESS FLIP~0L (Canceled at Frame ~D)~% " 
-                               *roll-to-jump-frames*)
-                       (format *stdcon* "Roll  -> Jump: ~5LSLOW FLIP~0L (Canceled at Frame ~D)~% " 
-                               *roll-to-jump-frames*)
-                       )
-                   )
+                ;; Display session accuracy
+                (format *stdcon* "----------------------------------------~%")
+                (let ((accuracy 0))
+                  (when (> *drill-attempts* 0)
+                    (set! accuracy (/ (* *drill-successes* 100) *drill-attempts*))
+                    )
+                  (format *stdcon* " Accuracy: ~D successes / ~D runs (~D%)~%" 
+                          *drill-successes* *drill-attempts* accuracy)
                   )
+                (format *stdcon* "========================================~%")
                 
-                ;; --- 4. REAL-TIME CALIBRATION FEEDBACK ---
-                (format *stdcon* "----------------------------------------~% ")
-                (cond
-                  (*had-uppercut*
-                   (format *stdcon* "~3LUPPERCUT DETECTED!~0L~% ")
-                   (format *stdcon* "Feedback: You held L1 *before* punching.~% ")
-                   (format *stdcon* "Fix: Tap Square FIRST, then slide to L1.~% ")
-                   )
-                  (*had-punch-jump*
-                   (format *stdcon* "~3LPUNCH JUMP DETECTED!~0L~% ")
-                   (format *stdcon* "Feedback: You jumped directly from the punch.~% ")
-                   (format *stdcon* "Fix: Your L1 lunge cancel was skipped or eaten.~% ")
-                   )
-                  ((and (> *punch-time* 0) (= *roll-time* 0) (> *l1-physical-press-frame* 0))
-                   (format *stdcon* "~3LINPUT WAS EATEN!~0L~% ")
-                   (format *stdcon* "Feedback: Physical L1 was tapped on Frame ~D.~% " *l1-physical-press-frame*)
-                   (format *stdcon* "Fix: Frame 0-7 is locked out. Wait until Frame 8-15.~% ")
-                   )
-                  (*had-flip*
-                   (format *stdcon* "~6LEXTENDED ROLL JUMP REGISTERED!~0L~% ")
-                   (format *stdcon* "Excellent execution. Record this feeling!~% ")
-                   )
-                  )
-                (format *stdcon* "========================================~% ")
-                
-                ;; --- 5. AUDIBLE RHYTHM METRONOME (450 BPM) ---
-                ;; 450 BPM maps perfectly to the timing profile of a physical slide-tap!
+                ;; --- 4. AUTO-SYNTHESIZED RHYTHM METRONOME ---
                 (when (!= beat-idx last-beat-idx)
                   (set! last-beat-idx beat-idx)
-                  (cond
-                    ((= measure-beat 0)
-                     ;; Beat 1: High-pitched lunge cue (Press Square)
-                     (sound-play-by-name (static-sound-name "money-pickup") (new-sound-id) 1024 1000 0 (the sound-group 1) #t)
-                     )
-                    ((= measure-beat 1)
-                     ;; Beat 2: Mid-pitched roll cue (Press L1)
-                     (sound-play-by-name (static-sound-name "money-pickup") (new-sound-id) 1024 200 0 (the sound-group 1) #t)
-                     )
-                    ((= measure-beat 2)
-                     ;; Beat 3: Low-pitched jump cue (Press X)
-                     (sound-play-by-name (static-sound-name "money-pickup") (new-sound-id) 1024 -600 0 (the sound-group 1) #t)
-                     )
+                  (when (= measure-beat 0)
+                    ;; Play Beat 1: High-pitched lunge cue (PING)
+                    (sound-play-by-name (static-sound-name "money-pickup") (new-sound-id) 1024 1200 0 (the sound-group 1) #t)
+                    (set! beat-start-ticks current-ticks)
+                    (set! played-beat-2 #f)
+                    (set! played-beat-3 #f)
+                    )
+                  )
+                
+                ;; Play Beat 2: Scheduled exactly at your learned transition boundary!
+                (when (and (!= *learned-gap1-min* 999) (not played-beat-2))
+                  (let ((target-beat2-ticks (+ beat-start-ticks (* *learned-gap1-min* 5))))
+                    (when (>= current-ticks target-beat2-ticks)
+                      (sound-play-by-name (static-sound-name "money-pickup") (new-sound-id) 1024 200 0 (the sound-group 1) #t)
+                      (set! played-beat-2 #t)
+                      )
+                    )
+                  )
+                
+                ;; Play Beat 3: Scheduled exactly at your learned second transition boundary!
+                (when (and (!= *learned-gap2-min* 999) played-beat-2 (not played-beat-3))
+                  (let ((target-beat3-ticks (+ beat-start-ticks (* *learned-gap1-min* 5) (* *learned-gap2-min* 5))))
+                    (when (>= current-ticks target-beat3-ticks)
+                      (sound-play-by-name (static-sound-name "money-pickup") (new-sound-id) 1024 -600 0 (the sound-group 1) #t)
+                      (set! played-beat-3 #t)
+                      )
                     )
                   )
                 )
@@ -249,29 +318,28 @@
           )
   )
 
-;; 4. Helper functions to safely start and stop the process
+;; Helper functions to safely start and stop the process
 (defun tempo-stop ()
   (kill-by-type tempo-process *active-pool*)
   (set! *tempo-process* (the-as handle #f))
-  (format #t "GOAL-Tempo background process stopped cleanly and screen cleared.~%")
+  (format #t "GOAL-Tempo background process stopped cleanly.~%")
   (none)
   )
 
 (defun tempo-start ()
   (tempo-stop)
-  ;; Reset states on start
-  (set! *punch-time* 0)
-  (set! *roll-time* 0)
-  (set! *jump-time* 0)
-  (set! *l1-physical-press-frame* 0)
-  (set! *x-physical-press-frame* 0)
-  (set! *punch-to-roll-frames* 0)
-  (set! *roll-to-jump-frames* 0)
-  (set! *had-running-attack* #f)
-  (set! *had-wheel* #f)
-  (set! *had-flip* #f)
-  (set! *had-uppercut* #f)
-  (set! *had-punch-jump* #f)
+  (set! *t1* 0)
+  (set! *t2* 0)
+  (set! *t3* 0)
+  (set! *p2-time* 0)
+  (set! *p3-time* 0)
+  (set! *learned-gap1-min* 999)
+  (set! *learned-gap1-max* 0)
+  (set! *learned-gap2-min* 999)
+  (set! *learned-gap2-max* 0)
+  (set! *drill-attempts* 0)
+  (set! *drill-successes* 0)
+  (set! *drill-status* "WAITING")
   (let ((proc (get-process *nk-dead-pool* tempo-process 1024)))
     (when proc
       (activate proc *active-pool* 'tempo *kernel-dram-stack*)
@@ -282,7 +350,3 @@
     )
   (none)
   )
-
-; Action Buttons: x, circle, square, triangle
-; Shoulder Buttons: l1, r1, l2, r2
-; Directions: up, down, left, right
