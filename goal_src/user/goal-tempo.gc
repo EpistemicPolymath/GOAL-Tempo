@@ -182,12 +182,18 @@
                      (set! *drill-status* 'gap1-active)
                      )
                     
-                    ;; B. Target entered State 2 (Double-buffered for sub-frame Uppercut transitions) [Process and State]
+                    ;; B. Target entered State 2 (Double-buffered for sub-frame transitions & landing offsets) [Process and State]
                     ((and (or (= s *drill-state-2*)
+                              ;; Case 1: Double-buffered Uppercut/Aerial transitions
                               (and (or (= *drill-state-2* 'target-attack-uppercut)
                                        (= *drill-state-2* 'target-attack-uppercut-jump))
                                    (or (= s 'target-attack-uppercut)
                                        (= s 'target-attack-uppercut-jump)))
+                              ;; Case 2: Multi-buffered Landing states (L-Stick active vs static landing stance)
+                              (and (= *drill-state-2* 'target-hit-ground)
+                                   (or (= s 'target-hit-ground)
+                                       (= s 'target-stance)
+                                       (= s 'target-walk)))
                               )
                           (!= (-> self last-state) s))
                      (when (= *drill-status* 'gap1-active)
